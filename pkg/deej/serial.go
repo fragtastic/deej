@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -37,11 +36,17 @@ type SerialIO struct {
 
 // SliderMoveEvent represents a single slider move captured by deej
 type SliderMoveEvent struct {
-	SliderID     int
+	SliderID     string
 	PercentValue float32
 }
 
-var expectedLinePattern = regexp.MustCompile(`^\d{1,4}(\|\d{1,4})*\r\n$`)
+var expectedLinePattern = regexp.MustCompile(`^[lrud]\n$`)
+
+var currentSliderIndex int = 0
+var currentSliderName string
+var wantedValue float32 = 0.0
+var isButtonHeld bool = false
+var needToUpdate bool = false
 
 // NewSerialIO creates a SerialIO instance that uses the provided deej
 // instance's connection info to establish communications with the arduino chip
@@ -82,9 +87,11 @@ func (sio *SerialIO) Start() error {
 		minimumReadSize = 1
 	}
 
+	// TODO - handle all of this in the config
+	// TODO - have the data/stop bits all have defaults/optional
 	sio.connOptions = serial.OpenOptions{
-		PortName:        sio.deej.config.ConnectionInfo.COMPort,
-		BaudRate:        uint(sio.deej.config.ConnectionInfo.BaudRate),
+		PortName:        sio.deej.configManager.Config.ConnectionInfo.SerialPort,
+		BaudRate:        sio.deej.configManager.Config.ConnectionInfo.BaudRate,
 		DataBits:        8,
 		StopBits:        1,
 		MinimumReadSize: uint(minimumReadSize),
@@ -147,7 +154,7 @@ func (sio *SerialIO) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 }
 
 func (sio *SerialIO) setupOnConfigReload() {
-	configReloadedChannel := sio.deej.config.SubscribeToChanges()
+	configReloadedChannel := sio.deej.configManager.SubscribeToChanges()
 
 	const stopDelay = 50 * time.Millisecond
 
@@ -167,8 +174,8 @@ func (sio *SerialIO) setupOnConfigReload() {
 				}()
 
 				// if connection params have changed, attempt to stop and start the connection
-				if sio.deej.config.ConnectionInfo.COMPort != sio.connOptions.PortName ||
-					uint(sio.deej.config.ConnectionInfo.BaudRate) != sio.connOptions.BaudRate {
+				if sio.deej.configManager.Config.ConnectionInfo.SerialPort != sio.connOptions.PortName ||
+					uint(sio.deej.configManager.Config.ConnectionInfo.BaudRate) != sio.connOptions.BaudRate {
 
 					sio.logger.Info("Detected change in connection parameters, attempting to renew connection")
 					sio.Stop()
@@ -236,63 +243,100 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 	}
 
 	// trim the suffix
-	line = strings.TrimSuffix(line, "\r\n")
+	line = strings.TrimSuffix(line, "\n")
+	// logger.Debugf("Got input '%s'", line)
 
-	// split on pipe (|), this gives a slice of numerical strings between "0" and "1023"
-	splitLine := strings.Split(line, "|")
-	numSliders := len(splitLine)
+	// Initial fetch to avoid 0 value by default.
+	// if needToFetchCurrentLevel {
+	// 	currentValue = sio.currentSliderPercentValues[currentSlider]
+	// 	needToFetchCurrentLevel = false
+	// }
+	switch line {
+	case "l":
+		if isButtonHeld {
+			logger.Debug("Channel previous")
+			currentSliderIndex--
+			if currentSliderIndex < 0 {
+				currentSliderIndex = 0
+			}
+			sliderMapping, _ := sio.deej.configManager.getSliderMappingByIndex(currentSliderIndex)
+			wantedValue = sliderMapping.Volume
 
-	// update our slider count, if needed - this will send slider move events for all
-	if numSliders != sio.lastKnownNumSliders {
-		logger.Infow("Detected sliders", "amount", numSliders)
-		sio.lastKnownNumSliders = numSliders
-		sio.currentSliderPercentValues = make([]float32, numSliders)
-
-		// reset everything to be an impossible value to force the slider move event later
-		for idx := range sio.currentSliderPercentValues {
-			sio.currentSliderPercentValues[idx] = -1.0
+			currentSliderName, _ = sio.deej.configManager.getSliderMappingKeyByIndex(currentSliderIndex)
+			logger.Debugf("Channel: %d %s", currentSliderIndex, currentSliderName)
+		} else {
+			sliderMapping, _ := sio.deej.configManager.getSliderMappingByKey(currentSliderName)
+			wantedValue = sliderMapping.Volume - 0.01
+			if wantedValue < 0.0 {
+				wantedValue = 0.0
+			}
+			needToUpdate = true
+			logger.Debugf("Lowering slider %d %s volume %d", currentSliderIndex, currentSliderName, wantedValue)
 		}
+	case "r":
+		if isButtonHeld {
+			logger.Debug("Channel next")
+			currentSliderIndex++
+			// why was 1024 specifically hardcoded originally in deej?
+			if currentSliderIndex > 1024 {
+				currentSliderIndex = 1024
+			}
+			sliderMappingCount := sio.deej.configManager.getSliderMappingCount()
+			if currentSliderIndex > sliderMappingCount {
+				currentSliderIndex = sliderMappingCount
+			}
+
+			sliderMapping, _ := sio.deej.configManager.getSliderMappingByIndex(currentSliderIndex)
+			wantedValue = sliderMapping.Volume
+
+			currentSliderName, _ = sio.deej.configManager.getSliderMappingKeyByIndex(currentSliderIndex)
+			logger.Debugf("Channel: %d %s", currentSliderIndex, currentSliderName)
+		} else {
+			sliderMapping, _ := sio.deej.configManager.getSliderMappingByKey(currentSliderName)
+			wantedValue = sliderMapping.Volume + 0.01
+			if wantedValue > 1.0 {
+				wantedValue = 1.0
+			}
+
+			needToUpdate = true
+			logger.Debugf("Raising slider %d %s volume %d", currentSliderIndex, currentSliderName, wantedValue)
+		}
+	case "d":
+		logger.Debug("Selecting channel")
+		isButtonHeld = true
+		// logger.Debugf("Num sliders %d", len(sio.deej.config.SliderMapping))
+		keys, _ := sio.deej.configManager.getSliderMappingKeys()
+		logger.Debugf("Sliders %+s", keys)
+
+		needToUpdate = false
+	case "u":
+		logger.Debug("Selecting volume")
+		isButtonHeld = false
+		// TODO - get current value and assign to both so it doesn't reset
+		// TODO - get average of values?
+		needToUpdate = false
+		currentSliderName, _ = sio.deej.configManager.getSliderMappingKeyByIndex(currentSliderIndex)
+		// currentValue = sio.deej.serial.currentSliderPercentValues[currentSlider]
+
+	default:
+		logger.Warnf("Unhandled input \"%s\"", line)
 	}
 
 	// for each slider:
 	moveEvents := []SliderMoveEvent{}
-	for sliderIdx, stringValue := range splitLine {
 
-		// convert string values to integers ("1023" -> 1023)
-		number, _ := strconv.Atoi(stringValue)
+	sliderMapping, _ := sio.deej.configManager.getSliderMappingByIndex(currentSliderIndex)
+	if needToUpdate && (wantedValue != sliderMapping.Volume) {
+		moveEvents = append(moveEvents, SliderMoveEvent{
+			SliderID:     currentSliderName,
+			PercentValue: wantedValue,
+		})
+		// sio.deej.config.Config.SliderMappings[currentSlider].Volume = wantedValue
+	}
 
-		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
-		// so let's check the first number for correctness just in case
-		if sliderIdx == 0 && number > 1023 {
-			sio.logger.Debugw("Got malformed line from serial, ignoring", "line", line)
-			return
-		}
-
-		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
-		dirtyFloat := float32(number) / 1023.0
-
-		// normalize it to an actual volume scalar between 0.0 and 1.0 with 2 points of precision
-		normalizedScalar := util.NormalizeScalar(dirtyFloat)
-
-		// if sliders are inverted, take the complement of 1.0
-		if sio.deej.config.InvertSliders {
-			normalizedScalar = 1 - normalizedScalar
-		}
-
-		// check if it changes the desired state (could just be a jumpy raw slider value)
-		if util.SignificantlyDifferent(sio.currentSliderPercentValues[sliderIdx], normalizedScalar, sio.deej.config.NoiseReductionLevel) {
-
-			// if it does, update the saved value and create a move event
-			sio.currentSliderPercentValues[sliderIdx] = normalizedScalar
-
-			moveEvents = append(moveEvents, SliderMoveEvent{
-				SliderID:     sliderIdx,
-				PercentValue: normalizedScalar,
-			})
-
-			if sio.deej.Verbose() {
-				logger.Debugw("Slider moved", "event", moveEvents[len(moveEvents)-1])
-			}
+	if sio.deej.Verbose() {
+		for _, event := range moveEvents {
+			logger.Debugw("Slider moved", "event", event)
 		}
 	}
 
@@ -301,6 +345,11 @@ func (sio *SerialIO) handleLine(logger *zap.SugaredLogger, line string) {
 		for _, consumer := range sio.sliderMoveConsumers {
 			for _, moveEvent := range moveEvents {
 				consumer <- moveEvent
+				// currentSliderValues[moveEvent.SliderID] = moveEvent.PercentValue
+				// TODO use a local function in config manager to lock/update the values
+				sm, _ := sio.deej.configManager.getSliderMappingByKey(moveEvent.SliderID)
+				sm.Volume = moveEvent.PercentValue
+				sio.deej.configManager.UpdateSliderMappingByKey(moveEvent.SliderID, sm)
 			}
 		}
 	}

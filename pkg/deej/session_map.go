@@ -123,7 +123,7 @@ func (m *sessionMap) getAndAddSessions() error {
 }
 
 func (m *sessionMap) setupOnConfigReload() {
-	configReloadedChannel := m.deej.config.SubscribeToChanges()
+	configReloadedChannel := m.deej.configManager.SubscribeToChanges()
 
 	go func() {
 		for {
@@ -185,8 +185,10 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 	matchFound := false
 
 	// look through the actual mappings
-	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
-		for _, target := range targets {
+	sliderMappings, _ := m.deej.configManager.getSliderMappings()
+	// for _, sliderMapping := range m.deej.configManager.Config.SliderMappings {
+	for _, sliderMapping := range sliderMappings {
+		for _, target := range sliderMapping.Targets {
 
 			// ignore special transforms
 			if m.targetHasSpecialTransform(target) {
@@ -198,10 +200,11 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 
 			if target == session.Key() {
 				matchFound = true
-				return
+				// return
+				break
 			}
 		}
-	})
+	}
 
 	return matchFound
 }
@@ -215,10 +218,11 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 	}
 
 	// get the targets mapped to this slider from the config
-	targets, ok := m.deej.config.SliderMapping.get(event.SliderID)
+	sliderMapping, err := m.deej.configManager.getSliderMappingByKey(event.SliderID)
 
 	// if slider not found in config, silently ignore
-	if !ok {
+	if err != nil {
+		m.logger.Error(err)
 		return
 	}
 
@@ -226,7 +230,7 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 	adjustmentFailed := false
 
 	// for each possible target for this slider...
-	for _, target := range targets {
+	for _, target := range sliderMapping.Targets {
 
 		// resolve the target name by cleaning it up and applying any special transformations.
 		// depending on the transformation applied, this can result in more than one target name

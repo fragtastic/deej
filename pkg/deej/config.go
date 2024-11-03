@@ -2,252 +2,345 @@ package deej
 
 import (
 	"fmt"
-	"path"
-	"strings"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/spf13/viper"
 	"go.uber.org/zap"
-
-	"github.com/omriharel/deej/pkg/deej/util"
+	"gopkg.in/yaml.v3"
 )
 
-// CanonicalConfig provides application-wide access to configuration fields,
-// as well as loading/file watching logic for deej's configuration file
-type CanonicalConfig struct {
-	SliderMapping *sliderMap
+// ConnectionInfo represents the settings for connecting to the Arduino board
+type ConnectionInfo struct {
+	SerialPort string `yaml:"serial_port"`
+	BaudRate   uint   `yaml:"baud_rate"`
+}
 
-	ConnectionInfo struct {
-		COMPort  string
-		BaudRate int
-	}
+// SliderMapping represents the mapping of sliders
+type SliderMapping struct {
+	Volume  float32  `yaml:"volume"`
+	Muted   bool     `yaml:"muted"`
+	Targets []string `yaml:"targets"`
+}
 
-	InvertSliders bool
+// Config represents the entire configuration structure
+type Config struct {
+	SliderMappings      map[string]SliderMapping `yaml:"slider_mappings"`
+	InvertSliders       bool                     `yaml:"invert_sliders"`
+	ConnectionInfo      ConnectionInfo           `yaml:"connection_info"`
+	NoiseReductionLevel string                   `yaml:"noise_reduction_level"`
+	ConfigSaveInterval  int                      `yaml:"config_save_interval"`
+}
 
-	NoiseReductionLevel string
-
+// ConfigManager manages config loading, watching, and notifying subscribers on changes
+type ConfigManager struct {
+	Config             *Config
+	orderedSliderKeys  []string
 	logger             *zap.SugaredLogger
 	notifier           Notifier
 	stopWatcherChannel chan bool
-
-	reloadConsumers []chan bool
-
-	userConfig     *viper.Viper
-	internalConfig *viper.Viper
+	reloadConsumers    []chan bool
+	configFilePath     string
+	lock               sync.Locker
+	configModified     bool
 }
 
-const (
-	userConfigFilepath     = "config.yaml"
-	internalConfigFilepath = "preferences.yaml"
-
-	userConfigName     = "config"
-	internalConfigName = "preferences"
-
-	userConfigPath = "."
-
-	configType = "yaml"
-
-	configKeySliderMapping       = "slider_mapping"
-	configKeyInvertSliders       = "invert_sliders"
-	configKeyCOMPort             = "com_port"
-	configKeyBaudRate            = "baud_rate"
-	configKeyNoiseReductionLevel = "noise_reduction"
-
-	defaultCOMPort  = "COM4"
-	defaultBaudRate = 9600
-)
-
-// has to be defined as a non-constant because we're using path.Join
-var internalConfigPath = path.Join(".", logDirectory)
-
-var defaultSliderMapping = func() *sliderMap {
-	emptyMap := newSliderMap()
-	emptyMap.set(0, []string{masterSessionName})
-
-	return emptyMap
-}()
-
-// NewConfig creates a config instance for the deej object and sets up viper instances for deej's config files
-func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, error) {
+// NewConfigManager creates a new ConfigManager instance
+func NewConfigManager(logger *zap.SugaredLogger, notifier Notifier, configFilePath string) (*ConfigManager, error) {
 	logger = logger.Named("config")
 
-	cc := &CanonicalConfig{
+	cm := &ConfigManager{
 		logger:             logger,
 		notifier:           notifier,
-		reloadConsumers:    []chan bool{},
 		stopWatcherChannel: make(chan bool),
+		reloadConsumers:    []chan bool{},
+		configFilePath:     configFilePath,
+		lock:               &sync.Mutex{},
 	}
 
-	// distinguish between the user-provided config (config.yaml) and the internal config (logs/preferences.yaml)
-	userConfig := viper.New()
-	userConfig.SetConfigName(userConfigName)
-	userConfig.SetConfigType(configType)
-	userConfig.AddConfigPath(userConfigPath)
-
-	userConfig.SetDefault(configKeySliderMapping, map[string][]string{})
-	userConfig.SetDefault(configKeyInvertSliders, false)
-	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
-	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
-
-	internalConfig := viper.New()
-	internalConfig.SetConfigName(internalConfigName)
-	internalConfig.SetConfigType(configType)
-	internalConfig.AddConfigPath(internalConfigPath)
-
-	cc.userConfig = userConfig
-	cc.internalConfig = internalConfig
-
-	logger.Debug("Created config instance")
-
-	return cc, nil
+	logger.Debug("Created config manager instance")
+	return cm, nil
 }
 
-// Load reads deej's config files from disk and tries to parse them
-func (cc *CanonicalConfig) Load() error {
-	cc.logger.Debugw("Loading config", "path", userConfigFilepath)
+// Load loads the configuration file into the Config struct
+// Update the Load function to store keys in the order they appear in YAML
+func (cm *ConfigManager) Load() error {
+	cm.logger.Debugw("Loading config", "path", cm.configFilePath)
 
-	// make sure it exists
-	if !util.FileExists(userConfigFilepath) {
-		cc.logger.Warnw("Config file not found", "path", userConfigFilepath)
-		cc.notifier.Notify("Can't find configuration!",
-			fmt.Sprintf("%s must be in the same directory as deej. Please re-launch", userConfigFilepath))
-
-		return fmt.Errorf("config file doesn't exist: %s", userConfigFilepath)
-	}
-
-	// load the user config
-	if err := cc.userConfig.ReadInConfig(); err != nil {
-		cc.logger.Warnw("Viper failed to read user config", "error", err)
-
-		// if the error is yaml-format-related, show a sensible error. otherwise, show 'em to the logs
-		if strings.Contains(err.Error(), "yaml:") {
-			cc.notifier.Notify("Invalid configuration!",
-				fmt.Sprintf("Please make sure %s is in a valid YAML format.", userConfigFilepath))
-		} else {
-			cc.notifier.Notify("Error loading configuration!", "Please check deej's logs for more details.")
+	file, err := os.Open(cm.configFilePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			cm.logger.Warnw("Config file not found", "path", cm.configFilePath)
+			cm.notifier.Notify("Can't find configuration!", fmt.Sprintf("%s must be in the directory. Please re-launch", cm.configFilePath))
+			return fmt.Errorf("config file doesn't exist: %s", cm.configFilePath)
 		}
+		return fmt.Errorf("error opening config file: %w", err)
+	}
+	defer file.Close()
 
-		return fmt.Errorf("read user config: %w", err)
+	decoder := yaml.NewDecoder(file)
+	decoder.KnownFields(true)
+
+	// What's the point of having defaults? It could be different on any system.
+	cm.Config = &Config{
+		ConfigSaveInterval: 60,
+		// Set default values
+		ConnectionInfo: ConnectionInfo{
+			SerialPort: "COM4",
+			BaudRate:   9600,
+		},
 	}
 
-	// load the internal config - this doesn't have to exist, so it can error
-	if err := cc.internalConfig.ReadInConfig(); err != nil {
-		cc.logger.Debugw("Viper failed to read internal config", "error", err, "reminder", "this is fine")
+	if err := decoder.Decode(cm.Config); err != nil {
+		cm.logger.Warnw("Failed to decode config", "error", err)
+		return fmt.Errorf("failed to decode config: %w", err)
 	}
 
-	// canonize the configuration with viper's helpers
-	if err := cc.populateFromVipers(); err != nil {
-		cc.logger.Warnw("Failed to populate config fields", "error", err)
-		return fmt.Errorf("populate config fields: %w", err)
+	// Populate orderedSliderKeys based on SliderMappings
+	cm.orderedSliderKeys = make([]string, 0, len(cm.Config.SliderMappings))
+	for key := range cm.Config.SliderMappings {
+		cm.orderedSliderKeys = append(cm.orderedSliderKeys, key)
 	}
 
-	cc.logger.Info("Loaded config successfully")
-	cc.logger.Infow("Config values",
-		"sliderMapping", cc.SliderMapping,
-		"connectionInfo", cc.ConnectionInfo,
-		"invertSliders", cc.InvertSliders)
+	cm.logger.Infof("Config loaded successfully with ordered keys: %+v", cm.orderedSliderKeys)
+	return nil
+}
+
+func (cm *ConfigManager) SaveConfig() error {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	// Open the file for writing
+	file, err := os.Create(cm.configFilePath)
+	if err != nil {
+		cm.logger.Warnw("Failed to open config file for writing", "error", err)
+		return fmt.Errorf("failed to open config file for writing: %w", err)
+	}
+	defer file.Close()
+
+	encoder := yaml.NewEncoder(file)
+	defer encoder.Close()
+
+	// Write the current configuration to the file
+	if err := encoder.Encode(cm.Config); err != nil {
+		cm.logger.Warnw("Failed to encode config to file", "error", err)
+		return fmt.Errorf("failed to encode config to file: %w", err)
+	}
+
+	// Reset the modified flag
+	cm.configModified = false
+	cm.logger.Info("Config saved successfully to disk")
 
 	return nil
 }
 
-// SubscribeToChanges allows external components to receive updates when the config is reloaded
-func (cc *CanonicalConfig) SubscribeToChanges() chan bool {
-	c := make(chan bool)
-	cc.reloadConsumers = append(cc.reloadConsumers, c)
+func (cm *ConfigManager) PeriodicallySaveConfig(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 
+	for {
+		select {
+		case <-ticker.C:
+			var shouldSave bool
+
+			// Check if config is modified inside the lock
+			// TODO - separate function to get "shouldSave"?
+			// Possibly just call save instead and have that function handle it since it already has it's own lock.
+			// Ran into a deadlock here by locking then calling save while locked, so above would be good change.
+			cm.lock.Lock()
+			if cm.configModified {
+				cm.logger.Info("Config modified, preparing to save...")
+				shouldSave = true
+			}
+			cm.lock.Unlock() // Release lock before saving to avoid deadlock
+
+			// If modified, save the config
+			if shouldSave {
+				if err := cm.SaveConfig(); err != nil {
+					cm.logger.Warnw("Failed to save config to disk", "error", err)
+				} else {
+					cm.logger.Info("Config saved to disk")
+				}
+			}
+
+		case <-cm.stopWatcherChannel:
+			cm.logger.Debug("Stopping periodic config save")
+			return
+		}
+	}
+}
+
+// SubscribeToChanges allows external components to subscribe to config reload notifications
+func (cm *ConfigManager) SubscribeToChanges() chan bool {
+	c := make(chan bool)
+	cm.reloadConsumers = append(cm.reloadConsumers, c)
 	return c
 }
 
-// WatchConfigFileChanges starts watching for configuration file changes
-// and attempts reloading the config when they happen
-func (cc *CanonicalConfig) WatchConfigFileChanges() {
-	cc.logger.Debugw("Starting to watch user config file for changes", "path", userConfigFilepath)
+// WatchConfigFileChanges starts watching the configuration file for changes and reloads it when modified
+func (cm *ConfigManager) WatchConfigFileChanges() {
+	cm.logger.Debugw("Watching config file for changes", "path", cm.configFilePath)
 
-	const (
-		minTimeBetweenReloadAttempts = time.Millisecond * 500
-		delayBetweenEventAndReload   = time.Millisecond * 50
-	)
+	const minTimeBetweenReloads = 500 * time.Millisecond
+	const delayAfterChange = 50 * time.Millisecond
 
-	lastAttemptedReload := time.Now()
+	lastReload := time.Now()
 
-	// establish watch using viper as opposed to doing it ourselves, though our internal cooldown is still required
-	cc.userConfig.WatchConfig()
-	cc.userConfig.OnConfigChange(func(event fsnotify.Event) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		cm.logger.Errorw("Failed to create file watcher", "error", err)
+		return
+	}
+	defer watcher.Close()
 
-		// when we get a write event...
-		if event.Op&fsnotify.Write == fsnotify.Write {
+	if err := watcher.Add(cm.configFilePath); err != nil {
+		cm.logger.Errorw("Failed to watch config file", "path", cm.configFilePath, "error", err)
+		return
+	}
 
-			now := time.Now()
-
-			// ... check if it's not a duplicate (many editors will write to a file twice)
-			if lastAttemptedReload.Add(minTimeBetweenReloadAttempts).Before(now) {
-
-				// and attempt reload if appropriate
-				cc.logger.Debugw("Config file modified, attempting reload", "event", event)
-
-				// wait a bit to let the editor actually flush the new file contents to disk
-				<-time.After(delayBetweenEventAndReload)
-
-				if err := cc.Load(); err != nil {
-					cc.logger.Warnw("Failed to reload config file", "error", err)
-				} else {
-					cc.logger.Info("Reloaded config successfully")
-					cc.notifier.Notify("Configuration reloaded!", "Your changes have been applied.")
-
-					cc.onConfigReloaded()
-				}
-
-				// don't forget to update the time
-				lastAttemptedReload = now
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
 			}
+			if event.Op&fsnotify.Write == fsnotify.Write {
+				now := time.Now()
+
+				if lastReload.Add(minTimeBetweenReloads).Before(now) {
+					cm.logger.Debugw("Config file modified, reloading", "event", event)
+
+					time.Sleep(delayAfterChange)
+
+					if err := cm.Load(); err != nil {
+						cm.logger.Warnw("Failed to reload config", "error", err)
+					} else {
+						cm.logger.Info("Config reloaded successfully")
+						cm.notifier.Notify("Configuration reloaded!", "Your changes have been applied.")
+						cm.notifySubscribers()
+					}
+					lastReload = now
+				}
+			}
+		case <-cm.stopWatcherChannel:
+			cm.logger.Debug("Stopping config file watcher")
+			return
 		}
-	})
-
-	// wait till they stop us
-	<-cc.stopWatcherChannel
-	cc.logger.Debug("Stopping user config file watcher")
-	cc.userConfig.OnConfigChange(nil)
+	}
 }
 
-// StopWatchingConfigFile signals our filesystem watcher to stop
-func (cc *CanonicalConfig) StopWatchingConfigFile() {
-	cc.stopWatcherChannel <- true
+// Function to get the key by index using the ordered keys slice
+func (cm *ConfigManager) getSliderMappingByKey(key string) (SliderMapping, error) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	mapping, exists := cm.Config.SliderMappings[key]
+	if !exists {
+		return SliderMapping{}, fmt.Errorf("slider mapping with key '%s' not found", key)
+	}
+	return mapping, nil
 }
 
-func (cc *CanonicalConfig) populateFromVipers() error {
+// Function to get the key by index using the ordered keys slice
+func (cm *ConfigManager) getSliderMappingByIndex(index int) (SliderMapping, error) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
 
-	// merge the slider mappings from the user and internal configs
-	cc.SliderMapping = sliderMapFromConfigs(
-		cc.userConfig.GetStringMapStringSlice(configKeySliderMapping),
-		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
-	)
+	if index < 0 || index >= len(cm.orderedSliderKeys) {
+		return SliderMapping{}, fmt.Errorf("invalid index '%d'", index)
+	}
+	key := cm.orderedSliderKeys[index]
+	return cm.Config.SliderMappings[key], nil
+}
 
-	// get the rest of the config fields - viper saves us a lot of effort here
-	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
+// Function to get the key by index using the ordered keys slice, with error handling
+func (cm *ConfigManager) getSliderMappingKeys() ([]string, error) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
 
-	cc.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
-	if cc.ConnectionInfo.BaudRate <= 0 {
-		cc.logger.Warnw("Invalid baud rate specified, using default value",
-			"key", configKeyBaudRate,
-			"invalidValue", cc.ConnectionInfo.BaudRate,
-			"defaultValue", defaultBaudRate)
-
-		cc.ConnectionInfo.BaudRate = defaultBaudRate
+	if len(cm.orderedSliderKeys) == 0 {
+		return nil, fmt.Errorf("no slider mapping keys available")
 	}
 
-	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
+	// Return a copy of the orderedSliderKeys to avoid external modification
+	keys := make([]string, len(cm.orderedSliderKeys))
+	copy(keys, cm.orderedSliderKeys)
 
-	cc.logger.Debug("Populated config fields from vipers")
-
-	return nil
+	return keys, nil
 }
 
-func (cc *CanonicalConfig) onConfigReloaded() {
-	cc.logger.Debug("Notifying consumers about configuration reload")
+func (cm *ConfigManager) getSliderMappingCount() int {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
 
-	for _, consumer := range cc.reloadConsumers {
-		consumer <- true
+	return len(cm.Config.SliderMappings)
+}
+
+// Function to get the key by index using the ordered keys slice, with error handling
+func (cm *ConfigManager) getSliderMappingKeyByIndex(index int) (string, error) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	if index < 0 || index >= len(cm.orderedSliderKeys) {
+		return "", fmt.Errorf("index %d is out of range", index)
 	}
+
+	return cm.orderedSliderKeys[index], nil
+}
+
+func (cm *ConfigManager) UpdateSliderMappingByKey(key string, mapping SliderMapping) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	cm.Config.SliderMappings[key] = mapping
+	cm.configModified = true
+	cm.logger.Debugw("Updated slider mapping", "key", key)
+}
+
+func (cm *ConfigManager) UpdateSliderMappingByIndex(index int, mapping SliderMapping) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	var key string = cm.orderedSliderKeys[index]
+	cm.Config.SliderMappings[key] = mapping
+	cm.configModified = true
+	cm.logger.Debugw("Updated slider mapping", "key", key)
+}
+
+// StopWatchingConfigFile stops watching the configuration file
+func (cm *ConfigManager) StopWatchingConfigFile() {
+	cm.stopWatcherChannel <- true
+}
+
+// notifySubscribers notifies all subscribed components of a config reload
+func (cm *ConfigManager) notifySubscribers() {
+	cm.logger.Debug("Notifying subscribers about config reload")
+	for _, subscriber := range cm.reloadConsumers {
+		subscriber <- true
+	}
+}
+
+// Function to retrieve all slider mappings in the order of orderedSliderKeys
+func (cm *ConfigManager) getSliderMappings() ([]SliderMapping, error) {
+	cm.lock.Lock()
+	defer cm.lock.Unlock()
+
+	if len(cm.orderedSliderKeys) == 0 {
+		return nil, fmt.Errorf("no slider mappings available")
+	}
+
+	mappings := make([]SliderMapping, 0, len(cm.orderedSliderKeys))
+	for _, key := range cm.orderedSliderKeys {
+		if mapping, exists := cm.Config.SliderMappings[key]; exists {
+			mappings = append(mappings, mapping)
+		} else {
+			return nil, fmt.Errorf("slider mapping for key '%s' not found", key)
+		}
+	}
+
+	return mappings, nil
+}
+func (cm *ConfigManager) StopPeriodicSave() {
+	cm.stopWatcherChannel <- true
 }

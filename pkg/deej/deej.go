@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -20,11 +21,11 @@ const (
 
 // Deej is the main entity managing access to all sub-components
 type Deej struct {
-	logger   *zap.SugaredLogger
-	notifier Notifier
-	config   *CanonicalConfig
-	serial   *SerialIO
-	sessions *sessionMap
+	logger        *zap.SugaredLogger
+	notifier      Notifier
+	configManager *ConfigManager
+	serial        *SerialIO
+	sessions      *sessionMap
 
 	stopChannel chan bool
 	version     string
@@ -41,18 +42,19 @@ func NewDeej(logger *zap.SugaredLogger, verbose bool) (*Deej, error) {
 		return nil, fmt.Errorf("create new ToastNotifier: %w", err)
 	}
 
-	config, err := NewConfig(logger, notifier)
+	configManager, err := NewConfigManager(logger, notifier, "config.yaml")
 	if err != nil {
 		logger.Errorw("Failed to create Config", "error", err)
 		return nil, fmt.Errorf("create new Config: %w", err)
 	}
+	go configManager.PeriodicallySaveConfig(10 * time.Second)
 
 	d := &Deej{
-		logger:      logger,
-		notifier:    notifier,
-		config:      config,
-		stopChannel: make(chan bool),
-		verbose:     verbose,
+		logger:        logger,
+		notifier:      notifier,
+		configManager: configManager,
+		stopChannel:   make(chan bool),
+		verbose:       verbose,
 	}
 
 	serial, err := NewSerialIO(d, logger)
@@ -87,7 +89,7 @@ func (d *Deej) Initialize() error {
 	d.logger.Debug("Initializing")
 
 	// load the config for the first time
-	if err := d.config.Load(); err != nil {
+	if err := d.configManager.Load(); err != nil {
 		d.logger.Errorw("Failed to load config during initialization", "error", err)
 		return fmt.Errorf("load config during init: %w", err)
 	}
@@ -139,7 +141,7 @@ func (d *Deej) run() {
 	d.logger.Info("Run loop starting")
 
 	// watch the config file for changes
-	go d.config.WatchConfigFileChanges()
+	go d.configManager.WatchConfigFileChanges()
 
 	// connect to the arduino for the first time
 	go func() {
@@ -149,9 +151,9 @@ func (d *Deej) run() {
 			// If the port is busy, that's because something else is connected - notify and quit
 			if errors.Is(err, os.ErrPermission) {
 				d.logger.Warnw("Serial port seems busy, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
+					"comPort", d.configManager.Config.ConnectionInfo.SerialPort)
 
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
+				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.configManager.Config.ConnectionInfo.SerialPort),
 					"This serial port is busy, make sure to close any serial monitor or other deej instance.")
 
 				d.signalStop()
@@ -159,9 +161,9 @@ func (d *Deej) run() {
 				// also notify if the COM port they gave isn't found, maybe their config is wrong
 			} else if errors.Is(err, os.ErrNotExist) {
 				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
+					"comPort", d.configManager.Config.ConnectionInfo.SerialPort)
 
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
+				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.configManager.Config.ConnectionInfo.SerialPort),
 					"This serial port doesn't exist, check your configuration and make sure it's set correctly.")
 
 				d.signalStop()
@@ -190,7 +192,7 @@ func (d *Deej) signalStop() {
 func (d *Deej) stop() error {
 	d.logger.Info("Stopping")
 
-	d.config.StopWatchingConfigFile()
+	d.configManager.StopWatchingConfigFile()
 	d.serial.Stop()
 
 	// release the session map

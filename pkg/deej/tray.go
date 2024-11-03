@@ -52,7 +52,9 @@ func (d *Deej) initializeTray(onDone func()) {
 						editor = "gedit"
 					}
 
-					if err := util.OpenExternal(logger, editor, userConfigFilepath); err != nil {
+					// TODO - get the path from config
+					// if err := util.OpenExternal(logger, editor, userConfigFilepath); err != nil {
+					if err := util.OpenExternal(logger, editor, "config.yaml"); err != nil {
 						logger.Warnw("Failed to open config file for editing", "error", err)
 					}
 
